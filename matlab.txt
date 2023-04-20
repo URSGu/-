@@ -1,0 +1,562 @@
+%----------非平衡补充 in-plane
+%-----散射次数、熵
+%-----涨落耗散：
+%-----------in-plane
+%--------------------频率段统计
+%镜面和漫反射都是仅仅改变了方向的版本，x_大改了
+clear
+% d_L = [ 50 80 100 150 200  300 400 500 800 1000] ;
+% d_d= [ 0 0.2 0.4 0.6 0.8 1];
+% d_L = [ 20 50 100 200 400   ];
+% d_L = [ 10 50 100 200 400 500 700 1000 ];
+d_L = [200];
+d_d= [0];
+
+% d_d = [0  0.5  1] ;% 0 ：纯漫反射； 1：纯净面反射
+
+%-------------input
+Material = string ( ['Si'] ) ;% [2DGaN Si Ge HfO2]
+input_data = xlsread('phonon data',Material) ;
+size_input_data = size(input_data) ;
+mode = input_data(:,2) + 1 ;   %将0-5转换成1-6模式
+omega = input_data(:,6) ;  %rad/s
+V=input_data(:,12) ;
+%---------
+for i=1:size_input_data(1,1)
+   while omega(i,1) <= 0 %将频率为负值的让其变为0
+       omega(i,1) = omega(floor(rand()*size_input_data(1,1)),1) ;
+   end
+   while V(i,1) < 0.1 %将速度小于0.1的让其变为0
+       V(i,1) = V(floor(rand()*size_input_data(1,1)),1) ;
+   end
+end  % 修正由第一性原理所导致的部分错误数据
+%---------
+
+cap=input_data(:,7) ;
+cap_total=sum(cap) ;
+tao=input_data(:,8) ; %s total
+%tao3ph=input_data(:,18) ; % 3phonon scattering
+
+MFP = mean( V.* tao ) ; % 平均自由程 mean free path
+k_bulk = sum ( cap.*V.^2.*tao) / 3 ;%体热导率
+disp(['体材料热导率=',num2str(k_bulk),'W/mK']);
+
+%-----deal with tao = 0 %弛豫时间为0，相当于未发生散射，属于弹道过程
+for i=1:size_input_data(1,1)
+   if  tao(i,1) == 0     
+       tao(i,1) = max (tao);
+   end
+%   if  tao3ph(i,1)==0
+%       tao3ph(i,1) = max (tao3ph);
+%   end
+end
+
+%--------------parameter
+hbar=1.054517e-34 ;%约化普朗克常数
+boltz=1.38065e-23 ;%玻尔兹曼常数
+
+
+k_eff=zeros(length(d_d),length(d_L));    % 有效热导率 （分母为热沉温差）
+% k_exp=zeros(length(d_d),length(d_L));  % 经验公式热导率
+k_cal2=zeros(length(d_d),length(d_L));   % 实际热导率存储矩阵
+ccc=zeros(length(d_d),length(d_L));      % 弹道占比存储矩阵
+Qx2=zeros(length(d_d),length(d_L));      % 平均热流存储矩阵
+Delta_T=zeros(length(d_d),length(d_L));  % 温差存储矩阵
+% Tx=zeros(length(d_L),100);               % X方向温度存储矩阵，100为xbin的大小
+
+for i_d = 1:1:length(d_d)
+    for i_L = 1:1:length(d_L)
+
+Teq = 300 ;
+Tinit = Teq  ; % initial temperature
+Tl = Teq + 1 ; % left wall
+Tr = Teq - 1 ; % right wall
+
+% System structure
+thickness = d_L( i_L )*1e-9 ;%长度方向（面向）
+% if 5*thickness*1e9<=1000    % 在与1D程序对比时，为了保证D>>L
+%     D=1000*1e-9;
+% else
+%     D = 5*thickness;         %宽度方向（法向）
+% end
+D=100e-9;
+d = d_d(i_d) ;  % 镜面度（镜面因子）
+disp(['长度x=',num2str(thickness*1e9),'nm',',宽度y=',num2str(D*1e9),'nm',',镜面度',num2str(d),',温差=',num2str(abs(Tl-Tr)),'K']);
+Kn = MFP / thickness ; %克努森数  （Kn越大，尺寸效应越明显）
+
+%------------ 网 格 划 分
+if thickness*1e9>100
+    xbin = floor(thickness*1e9/10); % 空间网格
+else
+    xbin = 10;
+end
+if D*1e9>100
+    ybin = fix(D*1e9/10);
+else
+    ybin=10;
+end
+% xbin=100;
+% ybin=10;
+% tbin=5000;
+d_xbin = thickness / xbin ; %length of bin 
+d_ybin = D / ybin ;
+
+tbin = floor(thickness*1e9*3) ;  % 时间网格（根据模型的尺寸调整，能到达稳态就可以，L=200nm时tbin约为1e3）
+d_tbin = 5e-13 ;
+tmax=d_tbin * tbin ; % max time
+t = 0:tmax/(tbin-1):tmax ; %times of measurement
+
+N = 6e6 ;  %最少得1e7
+disp(['xbin=',num2str(xbin),',ybin=',num2str(ybin),',tbin=',num2str(tbin),',MFP=',num2str(MFP*1e9),'nm',',Kn=',num2str(Kn),',N=',num2str(N)]);
+
+Nparticle = size_input_data(1,1) ; % 用于选择声子性质 Properties of  Phonon 
+Nmode = max( input_data(:,2) + 1 ) ;% 用于选择声子模式
+
+T  = zeros(ybin,xbin,tbin,Nmode+1) ; % array storing the temperature solution
+Q = zeros(ybin,xbin,tbin,Nmode+1) ; % array storing the heat flux solution
+% cumulative distribution functions
+cumul_base = zeros(Nparticle,1) ;
+cumul_coll = zeros(Nparticle,1) ;
+%cumul_3ph = zeros(Nparticle,1) ;
+cumul_vel  = zeros(Nparticle,1) ;
+
+cumul_base(1) = cap(1,1) ;
+cumul_coll(1) = cumul_base(1) / tao(1,1) ;
+%cumul_3ph(1) = cumul_base(1) / tao3ph(1,1) ;
+cumul_vel(1) = cumul_base(1) * V(1,1);
+for i=2:Nparticle
+%     cumul_base(i) = cumul_base(i-1) + cap(i,1) ;
+    cumul_coll(i) = cumul_coll(i-1) + cap(i) / tao(i,1) ;
+%    cumul_3ph(i) = cumul_3ph(i-1) + cumul_base(i) / tao3ph(i,1) ;
+    cumul_vel(i) = cumul_vel(i-1) + cap(i) * V(i,1) ;
+end
+
+%Deviational energy from the different sources
+enrgInit = D* thickness*cap_total*abs(Tinit-Teq)  ;
+enrgLeft = D* tmax * sum( V.* cap) * abs(Tl-Teq)  /4 ;
+enrgRight = D* tmax * sum( V.* cap) * abs(Tr-Teq) /4 ;
+
+% Total deviational energy
+enrgTot = enrgInit + enrgLeft + enrgRight ;
+
+% effective energy
+Eeff = enrgTot/N ;
+N_ball=0;
+
+%----------------------
+w_max = max( omega ) ;
+w_bin = 200 ;
+T_cont_f = zeros(w_bin,1) ;
+Q_cont_f = zeros(w_bin,1) ;
+%--------------------
+T_cont_m = zeros(max(mode),1) ;
+Q_cont_m = zeros(max(mode),1) ;
+% in_f = zeros(1,w_bin) ;
+% out_f = zeros(1,w_bin) ;
+%---------------cul
+in_L_f = zeros(w_bin,1) ;
+in_L_m = zeros(max(mode),1) ;
+in_R_f = zeros(w_bin,1) ;
+in_R_m = zeros(max(mode),1) ;
+out_L_f = zeros(w_bin,1) ;
+out_L_m = zeros(max(mode),1) ;
+out_R_f = zeros(w_bin,1) ;
+out_R_m = zeros(max(mode),1) ;
+
+c_s_b = 0 ; % count boundary scattering
+c_s_t = 0 ; % count 3-scattering
+S = zeros(tbin,1) ; 
+%-------------loop
+tic
+for i=1:N
+    %------进度条程序
+    if mod(i/N*100,20) == 0 
+        fprintf('%.0f%%\n', i/N*100) 
+        toc
+        tic
+    end   
+        %----------main body
+    Ri = rand(); %draw random number to decide is particle is emitted from left or right wall
+                % or from initial condition
+    if Ri < enrgInit/enrgTot % this case: emitted from initial source
+%         x0 = thickness*rand();
+%         y0 = D*rand();
+%         ind_mod = select_mode(cumul_base,Nparticle);
+%         R = 2*pi*rand() ;
+%         %R = 2*rand()-1; %this is cos(theta)
+%         vx = V(ind_mod)*cos(R) ; %! not be confused between V and vx
+%         vy = V(ind_mod)*sin(R) ;
+%         t0 = 0; % initial source => initial time of the particle is 0
+%         psign = sign(Tinit-Teq); % particle sign
+    else
+        
+        if Ri > enrgInit/enrgTot && Ri < 1-enrgRight/enrgTot  % emitted by left wall
+            x0 = 0;
+            ind_mod = select_mode(cumul_vel,Nparticle);
+            U=rand();% 参考了3D BTE的程序
+            cos_theta=sqrt(U);
+            sin_theta=sqrt(1-U);
+            vx=V(ind_mod)*cos_theta;
+            psign = sign(Tl-Teq) ;  % 统计温度的时候用
+            %--------cul
+            n_mode=mode(ind_mod,1);
+            ttt = floor(  omega(ind_mod,1) / w_max *w_bin ) + 1  ;
+            if ttt == w_bin+1
+               ttt = w_bin ;
+            end
+            in_L_f(ttt,1) = in_L_f(ttt,1) + 1 ;
+            in_L_m(n_mode,1) = in_L_m(n_mode,1) + 1 ;
+        else  % emitted by right wall
+            x0 = thickness;
+            ind_mod = select_mode(cumul_vel,Nparticle);
+            U=rand();
+            cos_theta=sqrt(U);
+            sin_theta=sqrt(1-U);
+            vx=-V(ind_mod)*cos_theta;
+            psign = sign(Tr-Teq);
+            %--------cul
+            n_mode=mode(ind_mod,1);
+            ttt = floor(  omega(ind_mod,1) / w_max *w_bin ) + 1  ;
+            if ttt == w_bin+1
+               ttt = w_bin ;
+            end
+            in_R_f(ttt,1) = in_R_f(ttt,1) + 1 ;
+            in_R_m(n_mode,1) = in_R_m(n_mode,1) + 1 ;
+            %--------cul end
+        end
+        vy = V(ind_mod)*sin_theta*sign(2*rand()-1);  %要保证sqrt(vx^2+vy^2)=V
+        y0 = D*rand(); 
+        t0 = rand()*t(tbin); % emission by a wall => initial time of the particle 
+                             % is anything between 0 and tmax
+    end  % if Ri < enrgInit/enrgTotv
+  
+    %ttt = floor(  omega(ind_mod,1) / w_max *w_bin )+1  ;
+    %in_f( 1,ttt ) = in_f( 1,ttt ) + 1 ;
+    
+    finished = false;  % as long as "false", the current particle is active
+    im = 1; % index for tracking measurement times
+    while t(im)<t0
+        im = im+1;
+    end
+    %-----phonon life
+    while ~finished
+        Delta_t = - tao(ind_mod) * log( rand() ) ; % time to next scattering event
+        t1 = t0 + Delta_t ; % time of next scattering event
+        x1 = x0 + Delta_t*vx ; % position of next scattering event
+        y1 = y0 + Delta_t*vy ;
+        
+        x_ = x0 + (t(im)-t0)*vx ; %% position at time tt(im)
+        y_ = y0 + (t(im)-t0)*vy ;
+                          
+if ( x0 == 0 && x1 >= thickness &&  y1<=D )|| ( x0 == thickness && x1 <= 0  && y1<=D)
+       N_ball=N_ball+1;
+end
+
+            % --- this part handles the contribution of the current particle to
+        % the final estimates ------------------- %
+            while (im<=tbin && t0<=t(im) && t1>t(im) && x_<=thickness && x_>=0)
+            
+%                 x_ = x0 + (t(im)-t(im-1))*vx ; %% position at time tt(im)
+%                 y_ = y0 + (t(im)-t(im-1))*vy ;
+               
+ %-no boundary scattering : start
+                %-------spectua;
+                %%
+                while y_<0 || y_>D   %为真则进入循环
+                    if rand() < d
+                        if y_ <= 0
+                            y_ = - y_ ;
+                        else
+                            y_ = 2*D - y_ ;
+                        end
+                        vy = -vy ;
+                        flag_b = 1 ;
+                        %difuse
+                    else    
+                        ind_mod = select_mode(cumul_vel,Nparticle);
+                        t1=t(im)- tao(ind_mod) * log( rand() );%声子在经过漫反射后，按重新发射处理，弛豫时间更新
+                        U = rand();
+                        cos_theta=sqrt(U);
+                        sin_theta=sqrt(1-U);
+                        c_s_b = c_s_b + 1;
+                        if y_ <= 0
+                            dt1 = abs(y_) / abs(vy) ;
+                            x_=x_-dt1*vx;
+                            vy = V(ind_mod)*sin_theta ;
+                            vx = V(ind_mod)* cos_theta * sign( 2*rand()-1 );
+                            y_=dt1*vy;x_=dt1*vx+x_;
+                        else
+                            dt1 = abs(y_-D) / abs(vy) ;
+                            x_=x_-dt1*vx;
+                            vy = -V(ind_mod)*sin_theta ;
+                            vx = V(ind_mod)*cos_theta*sign(2*rand()-1) ;
+                            y_=D+dt1*vy;x_=dt1*vx+x_;
+                        end
+                    end %if rand() < d
+                end    %while y_<0 || y_>D
+         
+%                figure(10) %绘制3个声子的轨迹图
+%                 axis([0 thickness 0 D]) ;
+% %                 if i==1
+%                 plot(x_,y_,'ko')
+% %                 elseif i==2
+% %                     plot(x_,y_,'bo')
+% %                 elseif i==3
+% %                     plot(x_,y_,'ro')
+% %                 end
+%                 hold on 
+                
+                indx = floor(x_/thickness*xbin)+1; %% index of the current spatial cell
+                indy = floor(y_/D*ybin)+1;
+                if (indx>0 && indx<xbin+1)
+%                     && indy>0 && indy<ybin+1
+                    S (im ,1 ) = S (im ,1 ) + 1;
+                    n_mode=mode(ind_mod,1);
+                    T(indy,indx,im,1) = T(indy,indx,im,1) + psign*Eeff/cap_total/d_xbin /d_ybin ; % temperature
+% % %                     T(indy,indx,im,n_mode+1) = T(indy,indx,im,n_mode+1) + psign*Eeff/cap_total/d_xbin /d_ybin ; % mode temperature
+                    Q(indy,indx,im,1) = Q(indy,indx,im,1) + psign*Eeff*vx/d_xbin /d_ybin; % heat flux 郭源（2-12）
+% % %                     Q(indy,indx,im,n_mode+1) = Q(indy,indx,im,n_mode+1) + psign*Eeff*vx/d_xbin /d_ybin; % mode heat flux
+                    %--------------contribution
+                    if im == tbin     
+                        ttt = floor(  omega(ind_mod,1) / w_max *w_bin ) + 1  ;
+                        if ttt == w_bin+1
+                            ttt = w_bin ;
+                        end
+                        T_cont_f( ttt,1 ) = T_cont_f( ttt,1 ) + psign*Eeff/cap_total/d_xbin /d_ybin ; 
+                        Q_cont_f( ttt,1 ) = Q_cont_f( ttt,1 ) + psign*Eeff*vx/d_xbin /d_ybin ;   
+% % %                         T_cont_m( n_mode,1 ) = T_cont_m( n_mode,1 ) + psign*Eeff/cap_total/d_xbin /d_ybin ; 
+% % %                         Q_cont_m( n_mode,1 ) = Q_cont_m( n_mode,1 ) + psign*Eeff*vx/d_xbin /d_ybin ;  
+                    end
+                    %--------------contribution END
+                end % if (indx>0 && indx<xbin+1  )
+                im = im + 1;
+                if im-1~=tbin
+                    x_ = x_ + (t(im)-t(im-1))*vx ;
+                    y_ = y_ + (t(im)-t(im-1))*vy ;
+                end
+            end   % while (im<tbin && t0<=t(im) && t1>t(im))      %---estimates end
+            
+            c_s_t = c_s_t + 1;
+            % select post-collision mode
+            %ind_mod = select_mode(cumul_3ph,Nparticle);
+            ind_mod = select_mode(cumul_coll,Nparticle) ; 
+            % update particle parameters
+            R = 2*pi*rand() ; % this is cos(theta)
+            vx = V(ind_mod)* cos (R) ;
+            vy = V(ind_mod)* sin (R) ;
+            x0 = x_ ;
+            y0 = y_ ;
+            t0 = t1 ;
+        
+        if (t0>t(tbin) || x0<0 || x0>thickness) 
+            % particle is terminated if it exits 
+            % the system or if it overshoots the 
+            % largest time of measurement 
+            finished = true ; 
+            %------------------cul
+            %--------cul
+            n_mode=mode(ind_mod,1);
+            ttt = floor(  omega(ind_mod,1) / w_max *w_bin ) + 1  ;
+            if ttt == w_bin+1
+               ttt = w_bin ;
+            end
+            if x0<0
+                out_L_f(ttt,1) = out_L_f(ttt,1) + 1 ;
+                out_L_m(n_mode,1) = out_L_m(n_mode,1) + 1 ;
+            end
+            if x0>thickness
+                out_R_f(ttt,1) = out_R_f(ttt,1) + 1 ;
+                out_R_m(n_mode,1) = out_R_m(n_mode,1) + 1 ; 
+            end
+            %--------cul end
+        end
+    end%-----phonon life end
+    %----------main body end
+    
+end
+%----Qx
+Qx=zeros(xbin,tbin);
+for i=1:tbin
+    for k=1:xbin   
+        Qx(k,i)=sum( Q(:,k,i,1) ) ;
+    end
+end
+%%%------------thermal conductivity
+Qx2(i_d,i_L) = mean( mean(Q(:,:,tbin,1)) ) ; 
+% Tx(i_L,1:xbin) = mean(T(:,:,tbin,1));
+Delta_T(i_d,i_L) = mean(T(:,1,tbin,1)) - mean(T(:,xbin,tbin,1));%空间网格越稀疏，该值越小，导致实际热导率偏大
+%k_cal2 = Qx2 * thickness / ( T(ybin/2,1,tbin,1) - T(ybin/2,xbin,tbin,1) ) 
+k_eff(i_d,i_L) = Qx2(i_d,i_L) * thickness / (  abs(Tl-Tr) );
+k_cal2(i_d,i_L) = Qx2(i_d,i_L) * thickness /  Delta_T(i_d,i_L);
+% k_exp(i_d,i_L)=k_bulk/(1+4*Kn/3);%法向（相对于声子运动方向而言）热导率计算的经验公式（由结果总结的）
+disp(['实际热导率=',num2str(k_cal2(i_d,i_L)),'W/mK']);
+disp(['有效热导率=',num2str(k_eff(i_d,i_L)),'W/mK']);
+%%%%%%%%%%%-------attention ( * d_ybin ) at the end of eq ,some thing wrong
+%%%%% in calculating in Q
+%% un-comment this for visualizing the solution
+% centroids of cells for measuring temperature
+                    % not really needed but useful for plotting results
+c=vpa(N_ball/N*100,4);
+disp(['弹道占比=',char(c),'%']);
+ccc(i_d,i_L)=N_ball/N;
+movieLength = 5; % duration of movie in seconds
+time=10;
+
+% hold on
+% figure(3) % 理论温度分布T(x) powered by华玉超（3-13）
+% Th=max(Tr,Tl);Tc=min(Tr,Tl);
+% x=thickness/2/xbin:thickness/xbin:thickness;%x方向坐标
+% Tx_theo=((Th+(Tc-Th)*x/thickness)+2*Kn*(Tc+Th)/3)/(1+4*Kn/3);
+% plot(x,Tx_theo,'b')
+% axis([0 thickness min(Tr,Tl) max(Tr,Tl)]);
+% % % 
+for i=1:tbin/100:tbin %温度云图
+   figure(1);
+       plot1=pcolor( T(:,:,i,1)+300 ) ;
+       plot1.FaceColor = 'interp' ;
+       colorbar ;
+       set(plot1, 'LineStyle','none') ; 
+       ylabel('Section in Y') ;
+       xlabel('Section in X') ;
+end
+for i=1:tbin/100:tbin/1 % x方向温度分布随时间的变化
+    figure(3);
+    k=thickness/2/xbin:thickness/xbin:thickness;
+    plot(k,mean(T(:,:,i,1)) + Teq,'or');  %  得到每一列均值的行向量
+    axis([0 thickness min(Tr,Tl) max(Tr,Tl)]);
+    pause(0.01);
+end
+for i=1:tbin/100:tbin/1  % x方向热流分布随时间的变化
+    figure(3);
+    k=thickness/2/xbin:thickness/xbin:thickness;
+    plot(k,mean(Q(:,:,i,1)),'or');
+    axis([0 thickness min(min(Q(:,:,tbin,1))) max(max(Q(:,:,tbin,1)))])
+    pause(0.05);
+end
+for i=1:tbin/100:tbin  % Y方向热流分布随时间的变化
+    figure(4);
+%     i=tbin;
+    k=D/2/ybin:D/ybin:D;
+%     plot(k,Q(:,5,i,1)','r'); 
+    plot(k,mean(Q(:,:,i,1)'),'r');  %  得到每一行均值的行向量(再转置)
+%     axis([0 D 5e6 2e8])
+    axis([0 D min(min(Q(:,:,tbin,1))) max(max(Q(:,:,tbin,1)))])
+    pause(0.01);
+end
+% for i=1:tbin/100:tbin/1% 热流云图
+%    figure(5);  
+%        plot2=pcolor( Q(:,:,i,1) ) ;
+%        plot2.FaceColor = 'interp';
+%        colorbar;
+%        set(plot2, 'LineStyle','none');
+%        ylabel('Section in Y');
+%        xlabel('Section in X');
+% end
+% % 
+% for i=1:1:tbin/50
+%    figure(3);       
+% %        k=1:1:xbin;
+%        k=thickness/2/xbin:thickness/xbin:thickness;
+%        plot(k,Qx(:,i));
+%        axis([0 thickness 0 max(max(Qx))]) ;
+%        xlabel('Section in X');
+%        ylabel('Heat Flux(W/m2)');
+%        pause(movieLength/tbin) ;
+% end
+% % % 
+% Qy=zeros(ybin,tbin);
+% for i=1:tbin
+%     for k=1:ybin   
+%         Qy(k,i)=sum( Q(k,:,i,1) ) ;
+%     end
+% end
+% 
+% for i=1:1:tbin/100
+%     figure(4);
+%     movieLength=10;
+%     k=D/2/ybin:D/ybin:D;
+%     plot(k,Qy(:,i))
+%     axis([0 D 0 max(max(Qy))]) ;
+%     xlabel('Section in Y');
+%     ylabel('Heat Flux(W/m2)');
+%     pause(movieLength/tbin) ;
+% end
+
+% Qxtenps=Qx(:,10)';
+% Qxtwotenps=Qx(:,20)';
+% Qxfivtyps=Qx(:,50)';
+% Qxhunderps=Qx(:,100)';
+% Qxtwohunps=Qx(:,200)';
+% Qxfivehunps=Qx(:,500)';
+% Qxthusps=Qx(:,1000)';
+% 
+% kpic=k'*1e9;
+% Qxtenps=Qx(:,10)/1e8;
+% Qxtwotenps=Qx(:,20)/1e8;
+% Qxfivtyps=Qx(:,50)/1e8;
+% Qxhunderps=Qx(:,100)/1e8;
+% Qxtwohunps=Qx(:,200)/1e8;
+% Qxfivehunps=Qx(:,500)/1e8;
+% Qxthusps=Qx(:,1000)/1e8;
+
+% for i=1:10:tbin/10
+% figure(5);
+% k=D/2/ybin:D/ybin:D;
+% %     plot(k,(Q(:,2,i,1)+Q(:,3,i,1)+Q(:,4,i,1))/3);
+% plot(k,(Q(:,4,i,1)+Q(:,5,i,1)+Q(:,6,i,1))/3);
+%     axis([0 D 0 6e8]) ;
+%     pause(0.1)
+% end
+% +Q(:,5,i,1)+Q(:,6,i,1)+Q(:,9,i,1)
+% Qy=(Q(:,4,i,1)+Q(:,5,i,1)+Q(:,6,i,1))/3;
+
+
+
+
+
+
+
+
+
+% %----------output
+% other_data = [w_max Kn thickness length MFP k_bulk k_cal2 d tmax c_s_b c_s_t ]; % 
+% %-----------file name
+% filename = string( [num2str(Material),'_output_12.3_',num2str(thickness*1e9),'X',num2str(length*1e9),'_',num2str(d),'_',num2str(Teq),'.xlsx'] );
+% %----------all T Qx
+% xlswrite(filename,T(:,:,tbin,1),'T') ;
+% xlswrite(filename,Q(:,:,tbin,1),'Q') ;
+% %-------------kappa
+% xlswrite(filename,other_data,'data') ;
+% xlswrite(filename,T_cont_m,'T_cont_m') ;
+% xlswrite(filename,T_cont_f,'T_cont_f') ;
+% xlswrite(filename,Q_cont_m,'Q_cont_m') ; 
+% xlswrite(filename,Q_cont_f,'Q_cont_f') ;
+% 
+% xlswrite(filename,in_L_f,'in_L_f');
+% xlswrite(filename,in_L_m,'in_L_m');
+% xlswrite(filename,in_R_f,'in_R_f');
+% xlswrite(filename,in_R_m,'in_R_m');
+% xlswrite(filename,out_L_f,'out_L_f');
+% xlswrite(filename,out_L_m,'out_L_m');
+% xlswrite(filename,out_R_f,'out_R_f');
+% xlswrite(filename,out_R_m,'out_R_m');
+% 
+% data3 = ( out_L_f + out_R_f )  ./ sum( in_L_f + in_R_f ) ;
+% data4 = ( out_L_m + out_R_m )  ./ sum( in_L_m + in_R_m ) ;
+% xlswrite(filename,data3,'data3');
+% xlswrite(filename,data4,'data4');
+% 
+% data5 = ( in_L_f + in_R_f )  ./ sum( in_L_f + in_R_f ) ;
+% data6 = ( in_L_m + in_R_m )  ./ sum( in_L_m + in_R_m ) ;
+% xlswrite(filename,data5,'data5');
+% xlswrite(filename,data6,'data6');
+% 
+% S = boltz * log ( S ) ;
+% xlswrite(filename,S,'S');
+% 
+% %------time of after-dealing
+% % other_data2 = [ in_f ; out_f ] ;
+% % xlswrite(filename,other_data2,'data2');
+toc
+    end
+end
